@@ -1,0 +1,525 @@
+/*================================================================================
+FILENAME		:	Goc-Ong_DP.c
+AUTHOR			:	Goc-Ong, Craig Joseph
+DESCRIPTION:		:	An MCU-based automated water sprinkler system that provides 
+					precise and timely irrigation based on real-time soil 
+					moisture levels.
+CREATED			:	May 16, 2024
+================================================================================*/
+
+/*================================================================================
+HEADER AND GLOBAL VARIABLES
+================================================================================*/
+	#include <xc.h>
+	#include <math.h>
+	#include <stdio.h>
+
+	#define _XTAL_FREQ 4000000
+
+	#define WET_VALUE 125     // ADC reading when soil is dry
+	#define DRY_VALUE 875     // ADC reading when soil is wet
+	#define FILTER_SIZE 10 // Number of samples to average
+
+	float moisture_percentage;
+	int secondTensPlace;
+	int secondOnesPlace;
+	int minuteTensPlace;
+	int minuteOnesPlace;
+	int hourTensPlace;
+	int hourOnesPlace;
+
+	int flagOn = 1;
+	int flagHigh = 1;
+	int time = 0x30;
+
+	int readings[FILTER_SIZE]; // Array to store readings
+	int readIndex = 0; // Index for the current reading
+	long total = 0; // Running total of readings
+
+	char MSS1[] = "Automated Watering";
+	char MSS2[] = "System";
+	char MSSL[] = "Moisture Level: ";
+
+/*================================================================================
+DS1307 ADDRESSES
+================================================================================*/
+	#define RTC_ADDRESS 		0xD0
+	#define second_add			0x00
+	#define minutes_add			0x01
+	#define hour_add			0x02
+	#define day_add				0x03
+	#define date_add			0x04
+	#define month_add			0x05
+	#define year_add			0x06
+	#define control_reg_add		0x07
+
+/*================================================================================
+PIC16F877A INITIALIZATIONS
+================================================================================*/
+	#pragma config FOSC = XT
+	#pragma config WDTE = OFF
+	#pragma config PWRTE = ON
+	#pragma config BOREN = ON
+	#pragma config LVP = OFF
+	#pragma config CPD = OFF
+	#pragma config WRT = OFF
+	#pragma config CP = OFF
+
+/*================================================================================
+I2C CONFIGURATIONS
+================================================================================
+FUNCTIONS		:	init_I2C_Master, I2C_Wait, I2C_Start, I2C_Repeated_Start, 
+					I2C_Stop, I2C_Send, I2C_Receive
+DESCRIPTION		:	Diaz, John Ivan
+				:	Goc-Ong, Craig Joseph
+				:	Manilong, Kaye Louise
+================================================================================*/
+	void init_I2C_Master(void)
+	{
+		TRISC3 = 1; // set RC3 (SCL) to input
+		TRISC4 = 1; // set RC4 (SDA) to input
+		SSPCON = 0x28; // SSP enabled, I2C master mode
+		SSPCON2 = 0x00; // start condition idle, stop condition idle
+		// receive idle
+		SSPSTAT = 0x80; // slew rate disabled
+		SSPADD = 0x09; // clock frequency at 100 KHz (FOSC = 4MHz)
+	}
+	void I2C_Wait(void)
+	{
+		/* wait until all I2C operation are finished*/
+		while((SSPCON2 & 0x1F) || (SSPSTAT & 0x04));
+	}
+	void I2C_Start(void)
+	{
+		/* wait until all I2C operation are finished*/
+		I2C_Wait();
+		/* enable start condition */
+		SEN = 1; // SSPCON2
+	}
+	void I2C_Repeated_Start(void)
+	{
+		/* wait until all I2C operation are finished*/
+		I2C_Wait();
+		/* enable start condition */
+		RSEN = 1; // SSPCON2
+	}
+	void I2C_Stop(void)
+	{
+		/* wait until all I2C operation are finished*/
+		I2C_Wait();
+		/* enable stop condition */
+		PEN = 1; // SSPCON2
+	}
+	void I2C_Send(unsigned char data)
+	{
+		/* wait until all I2C operation are finished*/
+		I2C_Wait();
+		/* write data to buffer and transmit */
+		SSPBUF = data;
+	}
+	unsigned char I2C_Receive(unsigned char ack)
+	{
+		unsigned char temp;
+		I2C_Wait(); // wait until all I2C operation are finished
+		RCEN = 1; // enable receive (SSPCON2 reg)
+		I2C_Wait(); // wait until all I2C operation are finished
+		temp = SSPBUF; // read SSP buffer
+		I2C_Wait(); // wait until all I2C operation are finished
+		ACKDT = (ack)?0:1; // set acknowledge (ACK) or not acknowledge (NACK)
+		ACKEN = 1; // enable acknowledge sequence
+		return temp;
+	}
+
+/*================================================================================
+LCD CONFIGURATIONS
+================================================================================
+FUNCTIONS		:	instCtrl, initLCD, dataCtrl, sendCharacter, sendString
+					decimal_to_bcd, LCD_Display
+DESCRIPTION		:	Functions necessary to initialize and configure the LCD to 
+					print a specific character to a specific position. Other
+					functions such as print a string using pointers are also 
+					included.
+================================================================================*/
+	void instCtrl(unsigned int data )
+	{	
+		PORTD = data;
+		__delay_ms(30);
+		RC6 = 0;
+		RC7 = 1;
+		__delay_ms(30);
+		RC7 = 0;
+	}
+	void initLCD()
+	{
+		__delay_ms(15);
+		instCtrl(0x38);
+		instCtrl(0x08);
+		instCtrl(0x01);
+		instCtrl(0x06);
+		instCtrl(0x0E);
+	}
+	void dataCtrl(unsigned int data )
+	{	
+
+		PORTD = data;
+		RC6 = 1;
+		RC7 = 1;
+		__delay_ms(30);
+		RC7 = 0;
+	}
+	void sendCharacter(char c) { 
+		dataCtrl(c);
+	}
+	void sendString(const char *str) {
+		while (*str != '\0') {
+			sendCharacter(*str);
+			str++;
+		}
+	}
+	char decimal_to_bcd(unsigned char value)
+	{
+		unsigned char msb, lsb,hex;
+		msb = value/10;
+		lsb = value%10;
+		hex = ((msb<<4)+lsb);
+		return hex;
+	}
+	void LCD_display()
+	{
+			instCtrl(0x01);
+			instCtrl(0x81);
+			sendString(MSS1);	
+			instCtrl(0xC6);
+			sendString(MSS2);
+			instCtrl(0x94);
+			dataCtrl('T');
+			dataCtrl('D');
+			dataCtrl(':');
+			instCtrl(0xD4);
+			sendString(MSSL);
+			flagOn = 0;
+
+			time += 0x02;
+			if(time==0x3A)
+				time = 0x30;
+	}
+
+/*================================================================================
+SYSTEM-SPECIFIC FUNCTIONS
+================================================================================
+FUNCTIONS		:	waterSystemLogic, bcd_to_ascii, bcd_to_ascii_sec, 
+					bcd_to_ascii_min, RTC_Read, RTC_Write, RTC_modulue, 
+					RTC_Receive, readADC
+DESCRIPTION		:	Functions necessary to handle the system-specific functios and
+					operations from the extraction from the RTC (Real-Time Clock)
+					module, ADC (Analog Digital Conversion) module for digital
+					signal processing, and other crucial operations.
+================================================================================*/
+	void waterSystemLogic()
+	{	
+		char MS1[22] = "Moisture Level: Low";
+		char MS2[18] = "Sprinkler: ON";
+
+		char MS3[22] = "Moisture Level: High";
+		char MS4[22] = "Moisture Level:Limit";
+		char MS5[18] = "Sprinkler: OFF";
+
+		__delay_ms(10);
+
+			if(minuteOnesPlace == time && RC1 == 0)
+			{
+				flagHigh = 1;
+				
+				if(moisture_percentage <30.0 )
+				{
+					instCtrl(0x01);
+					sendString(MS1);
+					instCtrl(0xC3);
+					sendString(MS2);
+					RC1 = 1;
+					instCtrl(0xD4);
+					sendString(MSSL);
+					instCtrl(0x94);
+					dataCtrl('A');
+					dataCtrl('S');
+					dataCtrl('W');
+					dataCtrl(':');		
+				}
+
+				if(moisture_percentage >=30.0 && flagHigh)
+				{
+					instCtrl(0x01);
+					sendString(MS3);
+					instCtrl(0xC3);
+					sendString(MS5);
+					RC1 = 0;
+					instCtrl(0x01);
+					flagOn = 1;
+					flagHigh = 0;
+					RB1 = ~RB1;
+				}
+			}
+		
+			if(moisture_percentage >=30.0 && RC1 == 1)
+			{
+				instCtrl(0x01);
+				instCtrl(0x80);
+				sendString(MS4);
+				instCtrl(0xC3);
+				sendString(MS5);	
+				RC1 = 0;
+				flagOn = 1;
+				RB0 = ~RB0;
+			}
+
+			if(flagOn)
+			LCD_display();
+	}
+
+	void bcd_to_ascii(unsigned char value)
+	{
+		char bcd;
+
+		bcd = value;
+		bcd = bcd & 0xF0;
+		bcd = bcd>>4;
+		bcd = bcd | 0x30;
+
+		secondTensPlace = bcd;
+
+		bcd = value;
+		bcd = bcd & 0x0F;
+		bcd = bcd | 0x30;
+
+		secondOnesPlace = bcd;	
+	}
+
+	void bcd_to_ascii_hour(unsigned char value)
+	{
+		char bcd;
+		TRISC1 = 0;
+
+		bcd = value;
+		bcd = bcd & 0xF0;
+		bcd = bcd>>4;
+		bcd = bcd | 0x30;
+
+		hourTensPlace = bcd;
+
+		bcd = value;
+		bcd = bcd & 0x0F;
+		bcd = bcd | 0x30;
+
+		hourOnesPlace = bcd;
+	}
+
+	void bcd_to_ascii_min(unsigned char value)
+	{
+		char bcd;
+		TRISC1 = 0;
+
+		bcd = value;
+		bcd = bcd & 0xF0;
+		bcd = bcd>>4;
+		bcd = bcd | 0x30;
+
+		minuteTensPlace = bcd;
+
+		bcd = value;
+		bcd = bcd & 0x0F;
+		bcd = bcd | 0x30;
+
+		minuteOnesPlace = bcd;
+	}
+
+	void bcd_to_ascii_date(unsigned char value)
+	{
+		char bcd;
+		TRISC1 = 0;
+
+		bcd = value;
+		bcd = bcd & 0xF0;
+		bcd = bcd>>4;
+		bcd = bcd | 0x30;
+
+		dataCtrl(bcd);
+
+		bcd = value;
+		bcd = bcd & 0x0F;
+		bcd = bcd | 0x30;
+
+		dataCtrl(bcd);
+	}
+
+	/*========================================
+	RTC WRITE
+	========================================*/
+		void RTC_modulue(char sec,char min,char hr,char day,char date,char month,char year)
+		{	
+			//Transmitting data
+			I2C_Start(); // iniate start condition
+
+			I2C_Send(RTC_ADDRESS);	// send the slave address + write
+			I2C_Send(second_add);
+
+			I2C_Send(decimal_to_bcd(sec));
+			I2C_Send(decimal_to_bcd(min));
+			I2C_Send(decimal_to_bcd(hr));
+			I2C_Send(decimal_to_bcd(day));
+			I2C_Send(decimal_to_bcd(date));
+			I2C_Send(decimal_to_bcd(month));
+			I2C_Send(decimal_to_bcd(year));
+			I2C_Send(0x00);
+			I2C_Stop(); // initiate stop condition
+		}
+
+	/*========================================
+	RTC READ
+	========================================*/
+		void RTC_Receive()
+		{
+			char _sec,_min,_hr,_day,_date,_month,_year, config;
+				//Receiving data
+			I2C_Start(); // iniate start condition
+			I2C_Send(RTC_ADDRESS);
+			I2C_Send(second_add);
+			
+			I2C_Repeated_Start(); // repeated start condition
+			I2C_Send(RTC_ADDRESS+1);
+			_sec = I2C_Receive(1);
+			_min= I2C_Receive(1);
+			_hr = I2C_Receive(1);
+			_day = I2C_Receive(1);
+			_date = I2C_Receive(1);
+			_month = I2C_Receive(1);
+			_year= I2C_Receive(1);
+			config = I2C_Receive(0);
+			I2C_Stop(); // initiate stop condition
+			__delay_ms(200);
+
+			bcd_to_ascii_hour(_hr);
+			bcd_to_ascii_min(_min);
+			bcd_to_ascii(_sec);
+				
+				instCtrl(0x97);
+				dataCtrl(hourTensPlace);
+				dataCtrl(hourOnesPlace);
+				dataCtrl('/');
+				dataCtrl(minuteTensPlace);
+				dataCtrl(minuteOnesPlace);
+				dataCtrl('/');
+				dataCtrl(secondTensPlace);
+				dataCtrl(secondOnesPlace);
+				dataCtrl(':');
+
+				bcd_to_ascii_date(_day);
+				dataCtrl('/');
+				bcd_to_ascii_date(_month);
+				dataCtrl('/');
+				bcd_to_ascii_date(_year);
+		}
+
+	/*========================================
+	ADC READ AND APPLYING DSP
+	========================================*/
+		void readADC(void)
+		{
+			int d_value = 0;
+			char valSM[8] = {0}; // Adjust size if needed
+
+			__delay_ms(10);
+			GO = 1;
+			while(GO_DONE); // Wait for ADC conversion to complete
+
+			/*========================================
+			Read ADC Result
+			========================================*/
+				d_value = ADRESH;
+				d_value = d_value << 8;
+				d_value = d_value | ADRESL;
+
+			/*========================================
+			Applying Moving Average Filter
+			========================================*/
+				total -= readings[readIndex];           // Remove oldest reading
+				readings[readIndex] = d_value;          // Store new reading
+				total += d_value;                       // Add new reading to total
+				readIndex = (readIndex + 1) % FILTER_SIZE; // Increment index
+				int filtered_d_value = total / FILTER_SIZE; // Calculate average
+		
+			/*========================================
+			Calculate moisture percentage using filtered value
+			========================================*/
+				moisture_percentage = 100.0 * (DRY_VALUE - filtered_d_value) / (DRY_VALUE - WET_VALUE);
+			
+			/*========================================
+			Display logic
+			========================================*/
+				waterSystemLogic();
+
+			/*========================================
+			Limit moisture percentage to 0-100 range
+			========================================*/
+				if (moisture_percentage < 0.0) moisture_percentage = 0.0;
+				if (moisture_percentage > 100.0) moisture_percentage = 100.0; 
+
+			/*========================================
+			Display logic
+			========================================*/
+				sprintf(valSM, "%.1f", moisture_percentage); // Use %.2f for two decimal places
+				instCtrl(0xE3);
+			
+			/*========================================
+			Ensure the valSM string fits within the display constraints
+			========================================*/
+				dataCtrl(valSM[0]);
+				dataCtrl(valSM[1]);
+				dataCtrl(valSM[2]);
+				dataCtrl(valSM[3]);
+				dataCtrl('%');  
+		}
+
+/*================================================================================
+MAIN FUNCTION
+================================================================================*/
+	
+	/*========================================
+	MASTER DEVICE
+	========================================*/
+		void main(void)
+		{
+			char sec,min,hr,day,date,month,year;
+
+			sec   =	0;
+			min   = 30;
+			hr 	  = 2;
+			day   = 27;
+			date  = 0;
+			month = 5;
+			year  = 24;
+			
+			TRISB0 = 0;
+			TRISB1 = 0;
+			RB0 = 0;
+			RB1 = 0;
+			TRISD = 0x00; // set all bits in PORTD to output
+			PORTD = 0x00; // all LEDs in PORTD are off
+			ADCON1 = 0x80;
+			ADCON0 = 0x01;
+			RC1 = 0;
+			TRISC6 = 0; // 
+			TRISC7 = 0; //
+
+			init_I2C_Master(); // initialize I2C as master
+			initLCD();
+			
+			RTC_modulue(sec,min,hr,day,date,month,year);
+
+			for(;;)
+			{
+
+			RTC_Receive();
+			__delay_ms(20);
+			readADC();	
+			}
+		}
